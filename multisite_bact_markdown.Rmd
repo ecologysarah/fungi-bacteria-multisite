@@ -1,0 +1,1685 @@
+---
+title: "Multisite bacterial community analysis"
+author: "Sarah R. Johnston"
+date: "16 March 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+## Load the requisite packages
+```{r load_packages, results='hide'}
+library(doParallel)
+library(dplyr)
+library(ggplot2)
+library(metacoder)
+library(vegan)
+```
+
+## Prepare the data for analysis
+###Bacterial data preparation
+Load in the bacterial OTU table.This is a .csv with samples as columns, OTUs as rows. The first column is a list of OTU IDs, and the column headers are sample names.
+There is also a file of sample metadata (the mapping file used in QIIME pre-processing, with additional columns added containing the soil and wood pH data).
+```{r bact_input}
+#Read in OTUs
+msbact1<-read.csv('multisite_gg_otu_table_exp-only.csv', header = TRUE)
+#Read in metadata
+metadat<-read.csv('multisite_map_pH_reiso_exp-only.csv', header = TRUE)
+
+#Make the samples rows and OTUs columns
+#Need to exclude the first column (OTU IDs) and then add it in a column names on new dframe
+#Otherwise R will make the OTU IDs the first row, and set every column as factors
+msbact2<-as.data.frame(t(msbact1[,-1]))
+colnames(msbact2) <- msbact1$X.OTU.ID
+summary(msbact2[,1:5])
+summary(msbact1[,1:5])
+
+#Remove sample 1339 (T10), which is of uncertain identity
+msbact2<-subset(msbact2, !rownames(msbact2)=="T10")
+metadat<-subset(metadat, !metadat$X.SampleID=="T10")
+#Remove columns with zero sums (created by removing some samples from the OTU table at an earlier stage)
+msbact2<-msbact2[,(!colSums(msbact2)==0)]
+
+#Check that the samples are in the same order in the OTU and metadata tables
+#Save sample ID as an object (currently stored as OTU row names)
+Sample.ID<-rownames(msbact2)
+#Check the order 
+metchar<-as.character(metadat$X.SampleID)
+all.equal(Sample.ID, metchar)
+#Sort both data frames to correct this
+metadat<-metadat[order(metadat$X.SampleID),]
+msbact<-msbact2[order(Sample.ID),]
+#Check again
+metchar<-as.character(metadat$X.SampleID)
+all.equal(rownames(msbact), metchar)
+
+#Calculate proportions
+bactprops<-msbact/rowSums(msbact)
+
+#Calculate the sequencing depth for bacterial samples
+depth<-(rowSums(msbact))
+#Convert it to a value between 0-255, for later use in plotting
+max(depth)/255 #=277.7
+grad<-depth/278
+
+#Calculate the OTU richness for bacterial samples
+richness<-rowSums(msbact>0) #Counts the number of occurrances for each OTU (because TRUE=1, FALSE=0)
+
+#Read in an additional copy of the OTU table with additional columns covering taxonomy. This will be used to subsequently match taxonomic information to the OTU identity.
+taxbact1<-read.csv('multisite_gg_otu_table_exp-only_with_taxonomy.csv', header = TRUE)
+taxbact<-taxbact1[,(!colnames(taxbact1)=="T10")]
+taxbact<-taxbact[(!rowSums(taxbact[,2:92])==0),]
+
+#Convert wood pH values onto a scale of 0-255, for later use in plotting
+max(metadat$Wood.pH, na.rm=T)/255 #=0.02431
+woodgrad<-metadat$Wood.pH/0.025
+#Replace missing values with 0
+woodgrad[is.na(woodgrad)] <- 0
+
+#Convert soil pH values onto a scale of 0-255, for later use in plotting
+max(metadat$Soil.pH, na.rm=T)/255 #=0.03059
+soilgrad<-metadat$Soil.pH/0.031
+soilgrad[is.na(soilgrad)] <- 0
+```
+The sample (row) order established here will be used for the rest of the analysis: it is **very important** that none of the data is reordered, as otherwise the samples will not align between different data frames.
+
+###Fungal data preparation
+Load in the fungal OTU table (data from Hiscox *et al.*, 2016, supplied by Jen Hiscox). This is a .csv with OTUs as columns, samples as rows. The first column is the original sample order, and the second column is the barcode identity for that sample. The column headers are OTU names.
+There is also a a file of sample metadata, which includes information on which barcode (tag) relate to which sample. The BLAST-assigned UNITE taxomony is contained within a third file.
+```{r fung_input}
+#Read in fungal OTUs and sort by tag
+allfungi<-read.csv("../all_tag_by_cluster_counts_order.csv")
+allfungi<-allfungi[order(allfungi$Tag),]
+
+#Read in sample ID information and sort by tag
+allfun.id<-read.csv("../Fungal_sample_ID.csv")
+allfun.id<-allfun.id[order(allfun.id$Tag.nospace),]
+
+#Read in BLAST-assigned taxonomy
+#Need to have stringsAsFactors = FALSE, or find.identity (used at a later stage) will return the level number, rather than the name
+blast<-read.csv("../All_cluster_seqs_with_IDs.csv", stringsAsFactors = FALSE)
+
+#The fungal dataset includes extra samples not in the bacterial dataset
+#Filter it to include only those samples that are also found in the bacteria metadata file
+fungi<-(allfungi[(allfun.id$ID.No %in% metadat$ID_No),])
+fun.id<-(allfun.id[(allfun.id$ID.No %in% metadat$ID_No),])
+#Put them in the same order as the bacterial samples
+fun.id<-fun.id[order(match(fun.id$ID.No,metadat$ID_No)),]
+fungi<-fungi[order(match(fungi$Tag,fun.id$Tag.nospace)),]
+
+#Check that the order is the same
+all.equal(fun.id$ID.No, metadat$ID_No, check.attributes = FALSE)
+all.equal(fungi$Tag, fun.id$Tag.nospace)
+
+#Remove the first two columns as they are identifiers,  not OTUS
+fungi<-fungi[,-c(1:2)]
+
+#Calculate proportions 
+funprops<-fungi/rowSums(fungi)
+```
+
+
+##Data exploration
+###Explore the bacterial data
+```{r bact_explore}
+#Sum counts within phyla
+phyla<-do.call(data.frame, aggregate(taxbact[,2:92], list(Phylum=taxbact$Phylum), FUN=sum))
+phyla<-as.data.frame(t(phyla[,-1]))
+phyla<-phyla[order(Sample.ID),] ##NB for this to work, Sample.ID must be stored from sorting the main OTU table
+
+#Raw data graphing - number of phyla in each sample type
+plot(rowSums(phyla > 0)~metadat$Precoloniser)
+plot(rowSums(phyla > 0)~metadat$Site)
+
+###Richness plotting
+richness<-rowSums(msbact>0) #Counts the number of occurrances for each OTU (because TRUE=1, FALSE=0)
+hist(richness)
+
+#Plot richness against precoloniser
+plot(richness~metadat$Precoloniser)
+#Compare for sequencing depth against precoloniser
+plot((rowSums(msbact))~metadat$Precoloniser)
+#Do the same for site
+plot(richness~metadat$Site)
+#Plot sequencing depth against site
+plot((rowSums(msbact))~metadat$Site)
+#Plot richness against sequencing depth
+plot(richness~(rowSums(msbact)))
+
+##Plot the mean-variance relationship to look for overdipersion
+#Calculate the mean and variance for each column
+bactmean<-apply (msbact, 2, mean)
+bactvar<- apply (msbact, 2, var)
+#Plot them against each other
+#The original plot was squashed because of a few large values, so use log y-axis; can chose only to view lower end by adding ', xlim=c(0,500), ylim=c(0, 1.5e+06)'
+plot (bactvar~bactmean, log='y')
+#Add in a curved line of slope y=x^2
+curve(x^2, 0, 1000, add=TRUE)
+
+
+##Plot explanatory variables against each other (Fig. S2 panels a-e)
+pdf("predictor_relationships.pdf", height=12, width=8)
+{
+par(mfrow=c(3,2))
+plot(metadat$Wood.pH~metadat$Precoloniser, notch=TRUE, xlab="Precoloniser", ylab="Wood pH")
+mtext("(a)", side=3, adj=-0.2)
+plot(metadat$Soil.pH~metadat$Precoloniser, notch=TRUE, xlab="Precoloniser", ylab="Soil pH")
+mtext("(b)", side=3, adj=-0.2)
+
+plot(metadat$Wood.pH~metadat$Site, notch=TRUE, xlab="Site", ylab="Wood pH", names=c("Bagley","Garth","Tintern","Usk","W'stone","W'ham"))
+mtext("(c)", side=3, adj=-0.2)
+plot(metadat$Soil.pH~metadat$Site, notch=TRUE, xlab="Site", ylab="Soil pH", names=c("Bagley","Garth","Tintern","Usk","W'stone","W'ham"))
+mtext("(d)", side=3, adj=-0.2)
+
+plot(metadat$Wood.pH~metadat$Soil.pH, xlab="Soil pH", ylab="Wood pH")
+mtext("(e)", side=3, adj=-0.2)
+}
+dev.off()
+```
+###Rarefying exploration
+```{r rarefying}
+#Subsample down to lowest read number - 866 (Wy21)
+rar1<-rrarefy(msbact, 866)
+
+#Use two cores to do 100 repetitions of this subsampling and save them as elements in a list
+#Aim to reduce subsampling bias by bootstrapping
+cl <- makeCluster(2)
+registerDoParallel(cl)
+getDoParWorkers()
+#At 866 samples
+rarifylist<-foreach(i=1:100, .packages = c("vegan")) %dopar% {
+  rrarefy(msbact, 866)
+}
+#At 1261 samples (second-lowest read number)
+lost1<-msbact[-which(rowSums(msbact)==866),]
+rarifylist2<-foreach(i=1:100, .packages = c("vegan")) %dopar% {
+  rrarefy(lost1, 1261)
+}
+
+stopCluster(cl)
+
+#Average multiple rarifactions and output as a matrix
+meanrar<-apply(simplify2array(rarifylist), 1:2, mean)
+meanrar2<-apply(simplify2array(rarifylist2), 1:2, mean)
+
+#Count the number of columns with zero sums and remove them
+sum(colSums(meanrar)==0)
+meanrar<-meanrar[,(!colSums(meanrar)==0)]
+
+#Richness for the single-rarefied data
+rarrich1<-rowSums(rar1>0)
+plot(rarrich1~depth)
+
+#Now do richness for averaged rarefied data
+rarrich<-rowSums(meanrar>0)
+#Plot it against seqeuncing depth
+plot(rarrich~depth)
+
+#...and averaged data rarefied to a deeper level
+rarrich2<-rowSums(meanrar2>0)
+lost1depth<-(rowSums(msbact[-which(rowSums(msbact)==866),]))
+plot(rarrich2~lost1depth)
+```
+
+Multiple rarefactions combined preserve the data structure including richness issues. A single rarefaction will only select some of the rare taxa in highly-sequenced samples. Repeated rarefactions differ in which of those rare taxa are selected.	Averaging rarefactions will encompass all those taxa, preserving the richness of the original sample – and the richness-depth relationship.
+
+```{r more-rarefying}
+#Plot the mean-variance relationship to look for overdispersion 
+rarmeans<-apply (meanrar2, 2, mean)
+rarvar<- apply (meanrar2, 2, var)
+plot (rarvar~rarmeans, log='y')
+curve(x^2, 0, 1000, add=TRUE)
+#Rarefied data is still overdispersed (as expected - McMurdie & Holmes 2014)
+
+#Fourth root transformation
+froot=(rar1)^(1/4)
+
+#Test for equal dispersion between treatments (important for PERMANOVA). Fourth root transformed data used to squash abundance differences. 
+dist <- vegdist((froot), method="bray")
+betadisper(dist, metadat$Precoloniser) 
+distmod <- anova(betadisper (dist, metadat$Precoloniser))
+distmod
+TukeyHSD(betadisper (dist, metadat$Precoloniser))
+#Single-rarefied data show unequal dispersion between Hf and other treatments; fourth-root transformation couldn’t remove it
+#The averaged-rarefied data show the same unequal dispersion; fourth-root transformation barely removes it
+
+#Test for equal dispersion on unrarified data. 
+dist2 <- vegdist((msbact), method="bray")
+betadisper(dist2, metadat$Precoloniser) 
+disp.model2 <- anova(betadisper (dist2, metadat$Precoloniser))
+disp.model2
+TukeyHSD(betadisper (dist2, metadat$Precoloniser))
+#Raw data does not show unequal dispersion between groups
+```
+
+###Explore the fungal data
+```{r fung_explore}
+#Find which fungal OTU is dominant in each sample
+#Write a function to find the highest value in a row (sample) and return the corresponding column name (OTU ID)
+find.top.name<-function(x){
+  (colnames(fungi)[(which.max(x))])
+}
+#Apply it to the fungal dataset
+top.names<-apply(fungi, 1, find.top.name)
+#Find what percentage of reads the top OTU accounts for in each sample
+top.vals<-apply(funprops, 1, max)
+#Make them into a data frame and add a column with the sample ID
+tops<-cbind.data.frame(top.names, top.vals)
+tops$Sample.ID<-metadat$X.SampleID
+
+#Pull out the corresponding species name for the top OTU in each sample
+find.identity<-function(x){
+  t<-match(x, blast$Name)
+  return(blast$Species[t])
+}
+tops$Species<-lapply(tops$top.names, find.identity)
+tops$Species<-unlist(tops$Species)
+tops$Species<-as.factor(tops$Species)
+
+#Do the same for the genus name for the top OTU in each sample
+find.genus<-function(x){
+  t<-match(x, blast$Name)
+  return(blast$X.15[t])
+}
+tops$Genus<-lapply(tops$top.names, find.genus)
+tops$Genus<-unlist(tops$Genus)
+tops$Genus<-as.factor(tops$Genus)
+
+#Do the same for phylum name for the top OTU in each sample
+find.phylum<-function(x){
+  t<-match(x, blast$Name)
+  return(blast$X.2[t])
+}
+tops$phylum<-lapply(tops$top.names, find.phylum)
+tops$phylum<-unlist(tops$phylum)
+tops$phylum<-as.factor(tops$phylum)
+
+#List whether the top OTU in each sample is classifed as decomposer or a co-coloniser (see Hiscox *et al.*, 2016 for details)
+find.decomp<-function(x){
+  t<-match(x, blast$Name)
+  return(blast$Co.col.or.decomp[t])
+}
+tops$decomp<-lapply(tops$top.names, find.decomp)
+tops$decomp<-unlist(tops$decomp)
+tops$decomp<-as.factor(tops$decomp)
+
+
+#Where the top OTU is a co-coloniser, see what % reads it accounts for compared to when it is a decomposer
+summary(subset(tops$top.vals, tops$decomp=="C"))
+summary(subset(tops$top.vals, tops$decomp=="D"))
+boxplot(tops$top.vals~tops$decomp)
+
+#List whether the top OTU in each sample comes from a genus of known cordformers
+#See what genera are represented
+levels(tops$Genus)
+tops$cords<-ifelse (tops$Genus=="Hypholoma"|tops$Genus=="Megacollybia"|tops$Genus=="Mutinus"|tops$Genus=="Phallus"|tops$Genus=="Resinicium", "CF", "Non-CF")
+tops$cords<-as.factor(tops$cords)
+tops$cords<-relevel(tops$cords, ref="Non-CF")
+
+#Calculate the proportion of ascomycetess vs basidiomycetess in each disk
+ascoprop<-rowSums(subset(funprops, select=(as.character(subset(blast$Name, blast$X.2=="Ascomycota")))))
+basidprop<-rowSums(subset(funprops, select=(as.character(subset(blast$Name, blast$X.2=="Basidiomycota")))))
+#Convert it to a value between 0-255, for later use in plotting
+ascotransp<-ascoprop*255
+basidtransp<-basidprop*255
+
+#Find out how much variation in wood pH is explained by fungus present
+woodan<-lm(metadat$Wood.pH~tops$Genus)
+wasresid<-(woodan$residuals-mean(woodan$residuals))/sd(woodan$residuals)
+qqnorm(wasresid)
+abline(0, 1)
+plot(wasresid~woodan$fitted.values)
+
+#Plot the proportion of basidiomycetes on each site (Fig. S2 panel f)
+plot(basidprop~metadat$Site, notch=TRUE, xlab="Site", ylab="Prop'tn basidiomycetes", names=c("Bagley","Garth","Tintern","Usk","W'stone","Wytham"))
+```
+
+
+##Ordination of the bacterial data
+```{r NMDS, results='hide'}
+#Bray-Curtis NMDS on raw data
+BCnmds2 <- metaMDS(msbact, trymax = 500, k=2, pc="TRUE", distance = "bray", autotransform = FALSE)
+```
+
+```{r display-ordination}
+BCnmds2
+plot(BCnmds2$points[,1],BCnmds2$points[,2], pch=20, col=metadat$Precoloniser, main="Bray-Curtis raw")
+
+#Colour by sequencing depth (Fig.S3)
+plot(BCnmds2$points, pch=20, col=rgb(red=255,blue=0,green=0,alpha=grad,maxColorValue=255))
+```
+
+Panelled graph showing the ordination plot coloured by explanatory variables (precol, site, wood pH, soil pH, persistance, genus, asco v basid, cord-formers) (Fig. 1)
+```{r fig1, results='hide'}
+pdf("eightway_NMDS.pdf")
+{
+par(mfrow=c(4,2), mar=c(5,5,1,1))
+#Colour by precoloniser
+plot(BCnmds2$points, type="n", xlim=c(-2.5, 1.5))
+legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+         col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(a)", side=3, adj=-0.2)
+points((subset(BCnmds2$points, metadat$Precoloniser=="C")), pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Precoloniser=="Vc")), pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Precoloniser=="Tv")), pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Precoloniser=="Hf")), pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Colour by site
+plot(BCnmds2$points, type="n", xlim=c(-2.5, 1.5))
+legend("topleft",  c("Bagley","Garth","Tintern","Usk","Wh'stone","Wytham"), pch=c(20,20,20,20), bty="n",  cex=0.8,
+       col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=101,blue=255,green=76,maxColorValue=255)),(rgb(red=255,blue=50,green=255,maxColorValue=255)),
+               (rgb(red=255,blue=0,green=127,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(b)", side=3, adj=-0.2)
+points((subset(BCnmds2$points, metadat$Site=="Bagley")), pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Site=="Garth")), pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Site=="Tintern")), pch=20, col=rgb(red=101,blue=255,green=76,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Site=="Usk")), pch=20, col=rgb(red=255,blue=50,green=255,maxColorValue=255))
+points(subset(BCnmds2$points, metadat$Site=="Whitestone"), pch=20, col=rgb(red=255,blue=0,green=127,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Site=="Wytham")), pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#By wood pH
+plot(BCnmds2$points, pch=20, xlim=c(-2.5, 1.5), col=rgb(red=200,blue=100,green=0,alpha=woodgrad,maxColorValue=255))
+mtext("(c)", side=3, adj=-0.2)
+#By soil pH
+plot(BCnmds2$points, pch=20, xlim=c(-2.5, 1.5), col=rgb(red=200,blue=0,green=100,alpha=soilgrad,maxColorValue=255))
+mtext("(d)", side=3, adj=-0.2)
+#By precoloniser persistance, with transparency dictated by proportion of disk occupied at the time of collection
+cpersist<-(subset(metadat$Persistance, metadat$Precoloniser=="C"))*2.55
+vcpersist<-(subset(metadat$Persistance, metadat$Precoloniser=="Vc"))*2.55
+tvpersist<-(subset(metadat$Persistance, metadat$Precoloniser=="Tv"))*2.55
+hfpersist<-(subset(metadat$Persistance, metadat$Precoloniser=="Hf"))*2.55
+plot(BCnmds2$points, pch=20, type="n", xlim=c(-2.5, 1.5))
+legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+       col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=0,blue=255,green=0,maxColorValue=255)),(rgb(red=0,blue=0,green=255,maxColorValue=255)),(rgb(red=255,blue=0,green=0,maxColorValue=255))))
+mtext("(e)", side=3, adj=-0.2)
+points((subset(BCnmds2$points, metadat$Precoloniser=="C")), pch=20, col=rgb(red=0,blue=0,green=0,alpha=cpersist,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Precoloniser=="Vc")), pch=20, col=rgb(red=0,blue=255,green=0,alpha=vcpersist,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Precoloniser=="Tv")), pch=20, col=rgb(red=0,blue=0,green=255,alpha=tvpersist,maxColorValue=255))
+points((subset(BCnmds2$points, metadat$Precoloniser=="Hf")), pch=20, col=rgb(red=255,blue=0,green=0,alpha=hfpersist,maxColorValue=255))
+#Colour by the genus of the dominant fungal OTU (only genera with >= 3 occurrances)
+plot(BCnmds2$points, type="n", xlim=c(-2.5, 1.5))
+legend("topleft",  c("Chalara","Hypholoma", "Lasiosphaeris", "Megacollybia","Mutinus","Phallus","Psathyrella","Scopuloides","Tubaria"), 
+  pch=c(20,20,20,20,20,20,20,20), bty="n",cex=0.7,
+  col=c(rgb(red=0,blue=0,green=0,maxColorValue=255),#black
+    rgb(red=255,blue=0,green=0,maxColorValue=255),#red
+    rgb(red=120,blue=60,green=60,maxColorValue=255),#brown
+    rgb(red=225,blue=50,green=150,maxColorValue=255),#orange
+    rgb(red=0,blue=0,green=255,maxColorValue=255),#green
+    rgb(red=255,blue=0,green=200,maxColorValue=255),#yellow
+    rgb(red=0,blue=255,green=255,maxColorValue=255),#cyan
+    rgb(red=0,blue=255,green=0,maxColorValue=255),#blue
+    rgb(red=255,blue=255,green=0,maxColorValue=255))#magenta
+)
+mtext("(f)", side=3, adj=-0.2)
+points((subset(BCnmds2$points, tops$Genus=="Chalara")), pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))#black
+points((subset(BCnmds2$points, tops$Genus=="Hypholoma")), pch=20, col=rgb(red=255,blue=0,green=0,maxColorValue=255))#red
+points((subset(BCnmds2$points, tops$Genus=="Lasiosphaeris")), pch=20, col=rgb(red=120,blue=60,green=60,maxColorValue=255))#brown
+points((subset(BCnmds2$points, tops$Genus=="Megacollybia")), pch=20, col=rgb(red=225,blue=50,green=150,maxColorValue=255))#orange
+points((subset(BCnmds2$points, tops$Genus=="Mutinus")), pch=20, col=rgb(red=0,blue=0,green=255,maxColorValue=255))#green
+points((subset(BCnmds2$points, tops$Genus=="Phallus")), pch=20, col=rgb(red=255,blue=0,green=200,maxColorValue=255))#yellow
+points((subset(BCnmds2$points, tops$Genus=="Psathyrella")), pch=20, col=rgb(red=0,blue=255,green=255,maxColorValue=255))#cyan
+points((subset(BCnmds2$points, tops$Genus=="Scopuloides")), pch=20, col=rgb(red=0,blue=255,green=0,maxColorValue=255))#blue
+points((subset(BCnmds2$points, tops$Genus=="Tubaria")), pch=20, col=rgb(red=255,blue=255,green=0,maxColorValue=255))#magenta
+#Colour by proportion of ascos vs basids
+plot(BCnmds2$points, type="n", xlim=c(-2.5, 1.5))
+legend("topleft",  c("Ascomycetes","Basidiomycetes"), pch=c(20,20), bty="n",cex=0.8,
+       col=c((rgb(red=255,blue=0,green=0,maxColorValue=255)),(rgb(red=0,blue=255,green=0,maxColorValue=255))))
+mtext("(g)", side=3, adj=-0.2)
+points(BCnmds2$points, pch=20, col=rgb(red=ascotransp,blue=basidtransp,green=0,maxColorValue=255))
+#Colour by whether the top fungal OTU is a known cord-former, with transparency dictated by % of the disk it occupies
+plot(BCnmds2$points, type="n", xlim=c(-2.5, 1.5))
+legend("topleft",  c("Cord-former","Other"), pch=c(20,20), bty="n",cex=0.8,
+       col=c((rgb(red=255,blue=0,green=0,maxColorValue=255)),(rgb(red=0,blue=0,green=0,maxColorValue=255))))
+mtext("(h)", side=3, adj=-0.2)
+cordtransp<-split(tops$top.vals*255, tops$cords)
+points((subset(BCnmds2$points, tops$cords=="CF")), pch=20, col=rgb(red=255,blue=0,green=0,alpha=cordtransp$CF,maxColorValue=255))
+points((subset(BCnmds2$points, tops$cords=="Non-CF")), pch=20, col=rgb(red=0,blue=0,green=0,alpha=cordtransp$`Non-CF`,maxColorValue=255))
+}
+dev.off()
+```
+
+Plot the ordination panelled by site, coloured by precoloniser (Fig. S4)
+```{r figS4, results='hide'}
+pdf("panelled_by_site.pdf")
+par(mfrow=c(3,2))
+for (i in levels(metadat$Site))
+{
+  plot(BCnmds2$points, type="n", main={i})
+  points((subset(BCnmds2$points, metadat$Precoloniser=="C" & metadat$Site=={i})), pch=20, cex=1.8, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+  points((subset(BCnmds2$points, metadat$Precoloniser=="Vc" & metadat$Site=={i})), pch=20, cex=1.8, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+  points((subset(BCnmds2$points, metadat$Precoloniser=="Tv" & metadat$Site=={i})), pch=20, cex=1.8, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+  points((subset(BCnmds2$points, metadat$Precoloniser=="Hf" & metadat$Site=={i})), pch=20, cex=1.8, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+}
+dev.off()
+```
+
+PCA with Hellinger transformation, for comparison with NMDS
+```{r Hellinger}
+hpca<-prcomp(decostand(msbact, "hellinger")) 
+summary(hpca)
+plot(hpca)
+hpca$sdev^2
+#Plot coloured by sequencing depth
+plot(hpca$x, pch=20, col=rgb(red=255,blue=0,green=0,alpha=grad,maxColorValue=255))
+```
+
+Panelled graph showing the ordination plot coloured by explanatory variables (precol, site, wood pH, soil pH, persistance, cord-formers) (Fig. S1)
+```{r figS1, results='hide'}
+pdf("hellinger_plots.pdf")
+{
+par(mfrow=c(3,2))
+#By precoloniser
+plot(hpca$x, type="n")
+legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n",
+       col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(a)", side=3, adj=-0.2)
+points((subset(hpca$x, metadat$Precoloniser=="C")), pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points((subset(hpca$x, metadat$Precoloniser=="Vc")), pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points((subset(hpca$x, metadat$Precoloniser=="Tv")), pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points((subset(hpca$x, metadat$Precoloniser=="Hf")), pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#By site
+plot(hpca$x, type="n")
+legend("topleft",  c("Bagley","Garth","Tintern","Usk","Wh'stone","Wytham"), pch=c(20,20,20,20), bty="n",
+       col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=101,blue=255,green=76,maxColorValue=255)),(rgb(red=255,blue=50,green=255,maxColorValue=255)),
+               (rgb(red=255,blue=0,green=127,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(b)", side=3, adj=-0.2)
+points((subset(hpca$x, metadat$Site=="Bagley")), pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points((subset(hpca$x, metadat$Site=="Garth")), pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points((subset(hpca$x, metadat$Site=="Tintern")), pch=20, col=rgb(red=101,blue=255,green=76,maxColorValue=255))
+points((subset(hpca$x, metadat$Site=="Usk")), pch=20, col=rgb(red=255,blue=50,green=255,maxColorValue=255))
+points((subset(hpca$x, metadat$Site=="Whitestone")), pch=20, col=rgb(red=255,blue=0,green=127,maxColorValue=255))
+points((subset(hpca$x, metadat$Site=="Wytham")), pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#By wood pH
+plot(hpca$x, pch=20, col=rgb(red=255,blue=100,green=0,alpha=woodgrad,maxColorValue=255))
+mtext("(c)", side=3, adj=-0.2)
+#By soil pH
+plot(hpca$x, pch=20, col=rgb(red=255,blue=0,green=100,alpha=soilgrad,maxColorValue=255))
+mtext("(d)", side=3, adj=-0.2)
+#By precoloniser persistence
+persist<-(metadat$Persistance)*1.25
+plot(hpca$x, pch=20, col=rgb(red=0,blue=100,green=100,alpha=persist,maxColorValue=255))
+mtext("(e)", side=3, adj=-0.2)
+#By cord-formers
+plot(hpca$x, type="n")
+legend("topleft",  c("Cord-former","Other"), pch=c(20,20), bty="n",cex=0.8,
+       col=c((rgb(red=255,blue=0,green=0,maxColorValue=255)),(rgb(red=0,blue=0,green=0,maxColorValue=255))))
+mtext("(f)", side=3, adj=-0.2)
+cordtransp<-split(tops$top.vals*255, tops$cords)
+points((subset(hpca$x, tops$cords=="CF")), pch=20, col=rgb(red=255,blue=0,green=0,alpha=cordtransp$CF,maxColorValue=255))
+points((subset(hpca$x, tops$cords=="Non-CF")), pch=20, col=rgb(red=0,blue=0,green=0,alpha=cordtransp$`Non-CF`,maxColorValue=255))
+}
+dev.off()
+```
+
+
+##PERMANOVA on the bacterial data
+```{r permanova, warning=FALSE, eval=FALSE}
+#Test for equal dispersion on unrarified data. 
+dist2 <- vegdist((msbact), method="bray")
+betadisper(dist2, metadat$Precoloniser) 
+disp.model2 <- anova(betadisper (dist2, metadat$Precoloniser))
+disp.model2
+TukeyHSD(betadisper (dist2, metadat$Precoloniser))
+
+#PERMANOVA
+pma<-adonis(msbact ~  metadat$Precoloniser*metadat$Site, permutations = 999, method = "bray", strata = NULL)
+pma
+boxplot(pma$coefficients~rownames(pma$coefficients))
+
+#Pairwise comparisons between treatments
+#Create a list containing subsets of the response variables (OTUS) in all pairwise combinations
+pairslist<-list(
+  BCVc=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Bagley"),
+  BCTv=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Bagley"),
+  BVcTv=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Bagley"),
+
+  GCVc=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Garth"),
+  GCTv=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Garth"),
+  GCHf=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Garth"),
+  GVcTv=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Garth"),
+  GVcHf=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Garth"),
+  GTvHf=subset(msbact, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Garth"),
+
+  TCVc=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Tintern"),
+  TCTv=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Tintern"),
+  TCHf=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Tintern"),
+  TVcTv=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Tintern"),
+  TVcHf=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Tintern"),
+  TTvHf=subset(msbact, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Tintern"),
+
+  UCVc=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Usk"),
+  UCTv=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Usk"),
+  UCHf=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Usk"),
+  UVcTv=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Usk"),
+  UVcHf=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Usk"),
+  UTvHf=subset(msbact, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Usk"),
+
+  WsCVc=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Whitestone"),
+  WsCTv=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Whitestone"),
+  WsCHf=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Whitestone"),
+  WsVcTv=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Whitestone"),
+  WsVcHf=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Whitestone"),
+  WsTvHf=subset(msbact, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Whitestone"),
+
+  WyCVc=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Wytham"),
+  WyCTv=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Wytham"),
+  WyCHf=subset(msbact, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham"),
+  WyVcTv=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Wytham"),
+  WyVcHf=subset(msbact, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham"),
+  WyTvHf=subset(msbact, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham")
+)
+
+#Pairwise predictor variables
+#Create a list containing subsets of the predictor variables (metadata) in all pairwise combinations
+metlist<-list(
+  mBCVc=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Bagley"),
+  mBCTv=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Bagley"),
+  mBVcTv=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Bagley"),
+
+  mGCVc=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Garth"),
+  mGCTv=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Garth"),
+  mGCHf=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Garth"),
+  mGVcTv=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Garth"),
+  mGVcHf=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Garth"),
+  mGTvHf=subset(metadat, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Garth"),
+
+  mTCVc=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Tintern"),
+  mTCTv=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Tintern"),
+  mTCHf=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Tintern"),
+  mTVcTv=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Tintern"),
+  mTVcHf=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Tintern"),
+  mTTvHf=subset(metadat, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Tintern"),
+
+  mUCVc=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Usk"),
+  mUCTv=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Usk"),
+  mUCHf=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Usk"),
+  mUVcTv=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Usk"),
+  mUVcHf=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Usk"),
+  mUTvHf=subset(metadat, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Usk"),
+
+  mWsCVc=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Whitestone"),
+  mWsCTv=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Whitestone"),
+  mWsCHf=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Whitestone"),
+  mWsVcTv=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Whitestone"),
+  mWsVcHf=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Whitestone"),
+  mWsTvHf=subset(metadat, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Whitestone"),
+
+  mWyCVc=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Wytham"),
+  mWyCTv=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Wytham"),
+  mWyCHf=subset(metadat, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham"),
+  mWyVcTv=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Wytham"),
+  mWyVcHf=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham"),
+  mWyTvHf=subset(metadat, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham")
+)
+
+#Run PERMANOVA on all pairwise combinations
+#Takes a long time
+#Currently returns warnings for model list: "number of items to replace is not a multiple of replacement length", probably because each model output is a sublist
+#Also returns 3 warnings: "Set of permutations < 'minperm'. Generating entire set." They pertain to the three comparisons involving Tintern Tv, probably because this treatment lost a replicate and is now too small for 999 permutations.
+pma.models<-list(length=33)
+pma.data<-list(length=33)
+pma.factors<-list(length=33)
+  for (i in 1:33)
+{
+  pma.data[i]<-names(pairslist[i])
+  pma.factors[i]<-names(metlist[i])
+  pma.met<-names(metlist[i])
+  print(pma.met) #Prints the name of each comparison, so warnings can be linked to the relevant test
+  pma.models[i]<-adonis(pairslist[[i]] ~ (metlist[[i]])$Precoloniser, permutations = 999, method = "bray", strata = NULL)
+}
+
+#Dispersion tests for all the pairwise combination datasets
+for (i in 1:33)
+{
+  pma.met<-names(metlist[i])
+  print(pma.met) #Prints the name of each comparison, so warnings can be linked to the relevant test
+  distx <- vegdist((pairslist[[i]]), method="bray")
+  disp.modelx <- anova(betadisper (distx, (metlist[[i]])$Precoloniser))
+  print(disp.modelx$`Pr(>F)`)
+}
+
+#Extract p-values from the pairwise tests
+plist<-numeric(33)
+for (i in 1:33) 
+{
+  plist[i]<-pma.models[[i]]$`Pr(>F)`[1] #Get only the first P-value from each table (for 'Precoloniser')
+}
+plist
+hist(plist)
+
+#Apply Benjamini-Hochberg multiple testing correction
+adjusted <- p.adjust(plist, method = "BH")
+adjusted
+hist(adjusted)
+
+#Combine columns: name of the response variable subset, name of the predictor variable subset, raw p-value and adjusted p-value
+p.pairs<-as.table(cbind(pma.data, pma.factors, plist, adjusted))
+
+#Examine values with borderline significance
+p.pairs[(p.pairs$adjusted<0.07),]
+```
+
+
+##Metacoder plots
+```{r metacoder-prep}
+#Take proportions and make into percentages
+taxbactprop<-(taxbact[,2:92]/(colSums(taxbact[,2:92]))*100)
+#Create a total abundance column
+taxbactprop$totab<-rowSums(taxbactprop)
+#Taxonomy information is currently stored in multiple columns - combine them into one |-separated column
+taxbactprop$mergetax<-paste(taxbact$Kingdom,"|",taxbact$Phylum,"|",taxbact$Class,"|",
+                        taxbact$Order,"|",taxbact$Family,"|",taxbact$Genus,"|",
+                        taxbact$Species)
+#Remove unwanted characters from the taxonomy column
+taxbactprop$mergetax<-gsub("\\[|\\]","",taxbactprop$mergetax)
+
+
+#Create taxmap object
+#Check that the last column contains the taxonomy
+colnames(taxbactprop[93])
+#Export as a csv and read it back in
+write.csv(taxbactprop,"taxbactprop.csv",quote = FALSE)
+bacttaxmap<-parse_taxonomy_table("taxbactprop.csv", taxon_col = c("class" = -1), 
+                                 other_col_type="obs_info", sep=",",
+                                 class_sep = "\\|")
+
+bacttaxmap
+#Remove reads unassigned at the Kingdom level  - need to first convert name column from character to factor
+bacttaxmap$taxon_data$name<-as.factor(bacttaxmap$taxon_data$name)
+bacttaxmap2<-filter_taxa(bacttaxmap, name == "Unassigned ", subtaxa = TRUE, invert=TRUE)
+#Remove 'species' and 'genus' levels as going beyond family level is not very meaningful for 16S rRNA data
+bacttaxmap2<-filter_taxa(bacttaxmap2, n_supertaxa < 5, reassign_obs = TRUE)
+```
+
+###Create subsets of the taxmap object for each precoloniser
+Create a list of sample names for each precoloniser
+```{r}
+cdisks<-as.character(subset(metadat$X.SampleID, metadat$Precoloniser=="C"))
+vcdisks<-as.character(subset(metadat$X.SampleID, metadat$Precoloniser=="Vc"))
+tvdisks<-as.character(subset(metadat$X.SampleID, metadat$Precoloniser=="Tv"))
+hfdisks<-as.character(subset(metadat$X.SampleID, metadat$Precoloniser=="Hf"))
+```
+First select only the relevant observation columns, then remove observation rows with 0 sum (i.e. OTUs that don't occur in any samples in that subset)
+```{r}
+ctm<-select_obs(bacttaxmap2, c(one_of(cdisks)))
+ctm<-filter_obs(ctm, rowSums(ctm$obs_data[,-1])>0)
+vctm<-select_obs(bacttaxmap2, c(one_of(vcdisks)))
+vctm<-filter_obs(vctm, rowSums(vctm$obs_data[,-1])>0)
+tvtm<-select_obs(bacttaxmap2, c(one_of(tvdisks)))
+tvtm<-filter_obs(tvtm, rowSums(tvtm$obs_data[,-1])>0)
+hftm<-select_obs(bacttaxmap2, c(one_of(hfdisks)))
+hftm<-filter_obs(hftm, rowSums(hftm$obs_data[,-1])>0)
+```
+
+Check that it works
+```{r}
+#Agrees that there are 7012 'Bacteria' OTUs in the Vc samples
+vcsubs<-taxbact[taxbact$Kingdom=="Bacteria",names(taxbact) %in% vcdisks]
+#Agrees that there are 4257 non-0 OTUs in the Vc samples
+vcsubs2<-vcsubs[rowSums(vcsubs) > 0,]
+```
+
+Remove taxa that don't occur in that subset
+```{r}
+ctm<-filter_taxa(ctm, n_obs >= 1)
+vctm<-filter_taxa(vctm, n_obs >= 1)
+tvtm<-filter_taxa(tvtm, n_obs >= 1)
+hftm<-filter_taxa(hftm, n_obs >= 1)
+```
+
+Work out the total abundance in the subset for each OTU
+```{r}
+ctm<-mutate_obs(ctm, subabun = rowSums(ctm$obs_data[,-1]))
+vctm<-mutate_obs(vctm, subabun = rowSums(vctm$obs_data[,-1]))
+tvtm<-mutate_obs(tvtm, subabun = rowSums(tvtm$obs_data[,-1]))
+hftm<-mutate_obs(hftm, subabun = rowSums(hftm$obs_data[,-1]))
+```
+
+Do read counts for each subset
+```{r}
+ctm<-mutate_taxa(ctm, read_counts = vapply(obs(ctm),
+                       function(x) sum(ctm$obs_data$subabun[x]), numeric(1)))
+vctm<-mutate_taxa(vctm, read_counts = vapply(obs(vctm),
+                       function(x) sum(vctm$obs_data$subabun[x]), numeric(1)))
+tvtm<-mutate_taxa(tvtm, read_counts = vapply(obs(tvtm),
+                       function(x) sum(tvtm$obs_data$subabun[x]), numeric(1)))
+hftm<-mutate_taxa(hftm, read_counts = vapply(obs(hftm),
+                       function(x) sum(hftm$obs_data$subabun[x]), numeric(1)))
+```
+
+Multiplot function (from http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/)
+```{r multiplot}
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+Heat tree for each precoloniser, with node size by abundance and colour by number of occurrances (Fig 2a)
+```{r fig2a, eval=FALSE}
+cht<-heat_tree(ctm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          title="Control disks",
+          title_size = 0.04)
+vcht<-heat_tree(vctm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          make_legend = FALSE,
+          title="Vuilleminia disks",
+          title_size = 0.04)
+tvht<-heat_tree(tvtm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          make_legend = FALSE,
+          title="Trametes disks",
+          title_size = 0.04)
+hfht<-heat_tree(hftm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          make_legend = FALSE,
+          title="Hypholoma disks",
+          title_size = 0.04)
+
+#Combine the four 'precoloniser' trees into one plot (Fig. 2a)
+multiplot(cht, tvht, vcht, hfht, cols=2)
+dev.print(pdf, "fourway-metacoder3.pdf")
+```
+
+###Create subsets of the taxmap object for each site
+Create a list of sample names for each site
+```{r}
+bdisks<-as.character(subset(metadat$X.SampleID, metadat$Site=="Bagley"))
+gdisks<-as.character(subset(metadat$X.SampleID, metadat$Site=="Garth"))
+tdisks<-as.character(subset(metadat$X.SampleID, metadat$Site=="Tintern"))
+udisks<-as.character(subset(metadat$X.SampleID, metadat$Site=="Usk"))
+wsdisks<-as.character(subset(metadat$X.SampleID, metadat$Site=="Whitestone"))
+wydisks<-as.character(subset(metadat$X.SampleID, metadat$Site=="Wytham"))
+```
+
+First select only the relevant observation columns, then remove observation rows with 0 sum
+```{r}
+btm<-select_obs(bacttaxmap2, c(one_of(bdisks)))
+btm<-filter_obs(btm, rowSums(btm$obs_data[,-1])>0)
+gtm<-select_obs(bacttaxmap2, c(one_of(gdisks)))
+gtm<-filter_obs(gtm, rowSums(gtm$obs_data[,-1])>0)
+ttm<-select_obs(bacttaxmap2, c(one_of(tdisks)))
+ttm<-filter_obs(ttm, rowSums(ttm$obs_data[,-1])>0)
+utm<-select_obs(bacttaxmap2, c(one_of(udisks)))
+utm<-filter_obs(utm, rowSums(utm$obs_data[,-1])>0)
+wstm<-select_obs(bacttaxmap2, c(one_of(wsdisks)))
+wstm<-filter_obs(wstm, rowSums(wstm$obs_data[,-1])>0)
+wytm<-select_obs(bacttaxmap2, c(one_of(wydisks)))
+wytm<-filter_obs(wytm, rowSums(wytm$obs_data[,-1])>0)
+```
+
+Remove taxa that don't occur in that subset
+```{r}
+btm<-filter_taxa(btm, n_obs >= 1)
+gtm<-filter_taxa(gtm, n_obs >= 1)
+ttm<-filter_taxa(ttm, n_obs >= 1)
+utm<-filter_taxa(utm, n_obs >= 1)
+wstm<-filter_taxa(wstm, n_obs >= 1)
+wytm<-filter_taxa(wytm, n_obs >= 1)
+```
+
+Work out the total abundance in the subset for each OTU
+```{r}
+btm<-mutate_obs(btm, subabun = rowSums(btm$obs_data[,-1]))
+gtm<-mutate_obs(gtm, subabun = rowSums(gtm$obs_data[,-1]))
+ttm<-mutate_obs(ttm, subabun = rowSums(ttm$obs_data[,-1]))
+utm<-mutate_obs(utm, subabun = rowSums(utm$obs_data[,-1]))
+wstm<-mutate_obs(wstm, subabun = rowSums(wstm$obs_data[,-1]))
+wytm<-mutate_obs(wytm, subabun = rowSums(wytm$obs_data[,-1]))
+```
+
+Do read counts for each subset
+```{r}
+btm<-mutate_taxa(btm, read_counts = vapply(obs(btm),
+                                           function(x) sum(btm$obs_data$subabun[x]), numeric(1)))
+gtm<-mutate_taxa(gtm, read_counts = vapply(obs(gtm),
+                                             function(x) sum(gtm$obs_data$subabun[x]), numeric(1)))
+ttm<-mutate_taxa(ttm, read_counts = vapply(obs(ttm),
+                                             function(x) sum(ttm$obs_data$subabun[x]), numeric(1)))
+utm<-mutate_taxa(utm, read_counts = vapply(obs(utm),
+                                             function(x) sum(utm$obs_data$subabun[x]), numeric(1)))
+wstm<-mutate_taxa(wstm, read_counts = vapply(obs(wstm),
+                                           function(x) sum(wstm$obs_data$subabun[x]), numeric(1)))
+wytm<-mutate_taxa(wytm, read_counts = vapply(obs(wytm),
+                                           function(x) sum(wytm$obs_data$subabun[x]), numeric(1)))
+```
+
+Heat tree for each site, with node size by abundance and colour by number of occurrances (Fig S5)
+```{r fig s5, eval=FALSE}
+bht<-heat_tree(btm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          title="Bagley",
+          title_size = 0.04)
+ght<-heat_tree(gtm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          make_legend = FALSE,
+          title="Garth",
+          title_size = 0.04)
+tht<-heat_tree(ttm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          make_legend = FALSE,
+          title="Tintern",
+          title_size = 0.04)
+uht<-heat_tree(utm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          make_legend = FALSE,
+          title="Usk",
+          title_size = 0.04)
+wsht<-heat_tree(wstm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          make_legend = FALSE,
+          title="Whitestone",
+          title_size = 0.04)
+wyht<-heat_tree(wytm, node_color = read_counts, #node_color_trans = "log10",
+          node_size = read_counts,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = read_counts,
+          overlap_avoidance=0.7,
+          node_label = ifelse(read_counts > 100, as.character(name), NA),
+          node_label_size_trans = "log10",
+          node_label_size_range = c(0.008, 0.02),
+          node_size_axis_label = "Number of OTUs",
+          node_color_axis_label = "Relative read abundance",
+          edge_size_axis_label = "Number of OTUs",
+          make_legend = FALSE,
+          title="Wytham",
+          title_size = 0.04)
+
+#Combine the six 'site' trees into one plot (Fig. S5)
+multiplot(bht, uht, ght, wsht, tht, wyht, cols=3)
+dev.print(pdf, "site-metacoder.pdf")
+```
+
+
+##Procrustes analysis
+The permutation test takes a long time to run.
+```{r procrustes, eval=FALSE}
+#Procrustes permutation
+prperm<-protest(funprops, bactprops)
+#Output summary to file as it won't fit in console
+sink("procrustes_permutation_summary.txt")
+prperm
+summary(prperm)
+sink()
+
+#Extract the Procrustean association metric (PAM)
+pam1<-residuals(prperm)
+
+#Test the explanatory power of different predictors
+#Effect of precoloniser
+lnpam<-log(pam1)
+pr.precol<-lm(lnpam~metadat$Precoloniser)
+sr.pr.precol<-(pr.precol$residuals-mean(pr.precol$residuals))/sd(pr.precol$residuals)
+qqnorm(sr.pr.precol)
+abline(0,1)
+plot(sr.pr.precol~pr.precol$fitted.values)
+summary(pr.precol)
+
+#Effect of site - better if not transformed
+pr.site<-lm(pam1~metadat$Site)
+sr.pr.site<-(pr.site$residuals-mean(pr.site$residuals))/sd(pr.site$residuals)
+qqnorm(sr.pr.site)
+abline(0,1)
+plot(sr.pr.site~pr.site$fitted.values)
+abline(0,0)
+summary(pr.site)
+
+#Effect of wood pH
+pr.wood<-lm(lnpam~metadat$Wood.pH)
+sr.pr.wood<-(pr.wood$residuals-mean(pr.wood$residuals))/sd(pr.wood$residuals)
+qqnorm(sr.pr.wood)
+abline(0,1)
+plot(sr.pr.wood~pr.wood$fitted.values)
+summary(pr.wood)
+
+#Effect of soil pH
+pr.soil<-lm(lnpam~metadat$Soil.pH)
+sr.pr.soil<-(pr.soil$residuals-mean(pr.soil$residuals))/sd(pr.soil$residuals)
+qqnorm(sr.pr.soil)
+abline(0,1)
+plot(sr.pr.soil~pr.soil$fitted.values)
+summary(pr.soil)
+
+#Plot effect of precoloniser persistance
+plot(pam1~metadat$Persistance, col=metadat$Precoloniser, pch=20)
+```
+
+###Plotting PAM (Fig 3)
+```{r fig3, eval=FALSE}
+pdf("fourway_pam.pdf")
+{
+par(mfrow=c(3,2), mar=c(5,5,1,1))
+#Boxplot by precoloniser overlain with data points
+plot(pam1~metadat$Precoloniser, xlab="Precoloniser", ylab="PAM", notch=T)
+mtext("(a)", side=3, adj=-0.2)
+stripchart(pam1~metadat$Precoloniser,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Boxplot by site overlain with data points
+plot(pam1~metadat$Site, xlab="Site", ylab="PAM", xaxt="n", notch=T)
+axis(side=1, at=c(1,2,3,4,5,6), labels = c("Bagley","Garth","Tintern","Usk","WS","Wytham"))
+mtext("(b)", side=3, adj=-0.2)
+stripchart(pam1~metadat$Site,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Plot by wood pH coloured by precoloniser
+plot(pam1~metadat$Wood.pH, type="n", xlab="Wood pH", ylab="PAM", xlim=c(3,6.25))
+legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+  col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(c)", side=3, adj=-0.2)
+points(metadat$Wood.pH[metadat$Precoloniser=="C"], pam1[metadat$Precoloniser=="C"], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Vc"], pam1[metadat$Precoloniser=="Vc"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Tv"], pam1[metadat$Precoloniser=="Tv"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Hf"], pam1[metadat$Precoloniser=="Hf"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Plot by soil pH coloured by site
+plot(pam1~metadat$Soil.pH, type="n", xlab="Soil pH", ylab="PAM", xaxt="n", xlim=c(3.75,7.75))
+axis(side=1, at=c(4.0,4.5,5.0,5.5,6.0,6.5,7.0,7.5))
+legend("topleft",  c("Bagley","Garth","Tintern","Usk","Wh'stone","Wytham"), pch=c(20,20,20,20), bty="n", cex=0.8,
+       col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=101,blue=255,green=76,maxColorValue=255)),(rgb(red=255,blue=50,green=255,maxColorValue=255)),
+               (rgb(red=255,blue=0,green=127,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(d)", side=3, adj=-0.2)
+points(metadat$Soil.pH[metadat$Site=="Bagley"], pam1[metadat$Site=="Bagley"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Garth"], pam1[metadat$Site=="Garth"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Tintern"], pam1[metadat$Site=="Tintern"], pch=20, col=rgb(red=101,blue=255,green=76,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Usk"], pam1[metadat$Site=="Usk"], pch=20, col=rgb(red=255,blue=50,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Whitestone"], pam1[metadat$Site=="Whitestone"], pch=20, col=rgb(red=255,blue=0,green=127,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Wytham"], pam1[metadat$Site=="Wytham"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+}
+dev.off()
+```
+
+
+##Richness
+```{r richness}
+#Plot richness
+hist(richness)
+
+#Calculate the variance for each sample
+richvar<- apply(msbact, 1, var)
+#Plot the dispersion
+plot (richvar~richness, log='y')
+curve(x^2, 0, 1000, add=TRUE)
+#Some overdispersion, but not as bad as the overall OTU overdispersion
+
+#Linear regression on richness vs sequencing depth, to obtained detrended estimates
+logrich<-log(richness)
+corr1<-glm(logrich~depth, family=gaussian(link = identity))
+summary(corr1)
+sresid1<-(corr1$residuals-mean(corr1$residuals))/sd(corr1$residuals)
+qqnorm(sresid1)
+abline(0,1)
+plot(sresid1~corr1$fitted.values)
+#Creating back-transformed residuals
+lrresid<-residuals(corr1, type = c("response"))
+expfitted<-exp(corr1$fitted.values)
+btresid<-richness - expfitted
+#Heteroscedasticity seems to largely come from the absence of wood pH in the model
+plot(btresid~metadat$Wood.pH, pch=20, xlab="Wood pH", ylab="Detrended richness")
+plot(btresid~metadat$Soil.pH, pch=20, xlab="Soil pH", ylab="Detrended richness")
+plot(btresid~metadat$Precoloniser, xlab="Precoloniser", ylab="Detrended richness", notch=T)
+plot(btresid~metadat$Site, xlab="Site", ylab="Detrended richness", notch=T)
+plot(btresid~tops$cords, xlab="Cord formers", ylab="Detrended richness", notch=T)
+plot(btresid~tops$decomp, xlab="Co-colonisers vs. decomposers", ylab="Detrended richness", notch=T)
+#Plot wood pH against depth
+plot(metadat$Wood.pH~depth, pch=20, xlab="Sequencing Depth", ylab="Wood pH")
+points(metadat$Soil.pH[metadat$Site=="Wytham"], btresid[metadat$Site=="Wytham"], pch=20, col=rgb(red=255,blue=0,green=255,maxColorValue=255))
+```
+
+###Panelled graph of richness (Fig. 4)
+```{r fig4}
+pdf("sixway_richness.pdf")
+{
+par(mfrow=c(3,2), mar=c(5,5,1,1))
+#Boxplot by precoloniser
+plot(btresid~metadat$Precoloniser, xlab="Precoloniser", ylab="Detrended richness", notch=T)
+mtext("(a)", side=3, adj=-0.2)
+stripchart(btresid~metadat$Precoloniser,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Boxplot by site
+plot(btresid~metadat$Site, xlab="Site", ylab="Detrended richness", xaxt="n", notch=T)
+axis(side=1, at=c(1,2,3,4,5,6), labels = c("Bagley","Garth","Tintern","Usk","WS","Wytham"))
+mtext("(b)", side=3, adj=-0.2)
+stripchart(btresid~metadat$Site,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Plot by wood pH coloured by precoloniser
+plot(btresid~metadat$Wood.pH, type="n", xlab="Wood pH", ylab="Detrended richness")
+legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+  col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(c)", side=3, adj=-0.2)
+points(metadat$Wood.pH[metadat$Precoloniser=="C"], btresid[metadat$Precoloniser=="C"], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Vc"], btresid[metadat$Precoloniser=="Vc"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Tv"], btresid[metadat$Precoloniser=="Tv"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Hf"], btresid[metadat$Precoloniser=="Hf"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Plot by soil pH coloured by site
+plot(btresid~metadat$Soil.pH, type="n", xlab="Soil pH", ylab="Detrended richness", xaxt="n", xlim=c(3.25,7.75))
+axis(side=1, at=c(3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0,7.5))
+legend("topleft",  c("Bagley","Garth","Tintern","Usk","Wh'stone","Wytham"), pch=c(20,20,20,20), bty="n", cex=0.8,
+  col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=101,blue=255,green=76,maxColorValue=255)),(rgb(red=255,blue=50,green=255,maxColorValue=255)),
+               (rgb(red=255,blue=0,green=127,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(d)", side=3, adj=-0.2)
+points(metadat$Soil.pH[metadat$Site=="Bagley"], btresid[metadat$Site=="Bagley"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Garth"], btresid[metadat$Site=="Garth"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Tintern"], btresid[metadat$Site=="Tintern"], pch=20, col=rgb(red=101,blue=255,green=76,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Usk"], btresid[metadat$Site=="Usk"], pch=20, col=rgb(red=255,blue=50,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Whitestone"], btresid[metadat$Site=="Whitestone"], pch=20, col=rgb(red=255,blue=0,green=127,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Wytham"], btresid[metadat$Site=="Wytham"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Plot by asco-basid split
+plot(btresid~basidprop, type="n", xlab="Proportion Basidiomycota", ylab="Detrended richness", xlim=c(-0.07, 1.02), ylim=c(-750,875))
+points(basidprop, btresid, pch=20, col=rgb(red=ascotransp,blue=basidtransp,green=0,maxColorValue=255))
+legend("topleft",  c("Ascomycetes","Basidiomycetes"), pch=c(20,20), bty="n", cex=0.8,
+       col=c((rgb(red=255,blue=0,green=0,maxColorValue=255)),(rgb(red=0,blue=255,green=0,maxColorValue=255))))
+mtext("(e)", side=3, adj=-0.2)
+#Boxplot by cord-formers
+plot(btresid~tops$cords, xlab="Cord-forming", ylab="Detrended richness", notch=T)
+mtext("(f)", side=3, adj=-0.2)
+stripchart(btresid~tops$cords,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+}
+dev.off()
+```
+
+###Modelling richness
+```{r richness-model}
+richmod<-glm(logrich~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+rich.sresid<-(richmod$residuals-mean(richmod$residuals))/sd(richmod$residuals)
+qqnorm(rich.sresid)
+abline(0, 1)
+plot(rich.sresid~richmod$fitted.values)
+hist(rich.sresid)
+
+summary(richmod)
+exp(richmod$coefficients) #gives the ratio of the group mean to that of the baseline
+
+#Save the coefficients for each precoloniser along with identifying information
+coef<-richmod$coefficients[1:5]
+precol<-rep("C", each=5)
+site<-rep("Bagley", each=5)
+modnames<-names(richmod$coefficients[1:5])
+
+
+#Now repeat for the other levels
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Vc")
+#Re-run model
+richmod<-glm(log(richness)~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+#Append new coefficients
+coef<-append(coef, richmod$coefficients[1:5])
+precol<-append(precol,(rep("Vc", each=5)))
+site<-append(site,(rep("Bagley", each=5)))
+modnames<-append(modnames,(names(richmod$coefficients[1:5])))
+
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Tv")
+richmod<-glm(log(richness)~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+coef<-append(coef, richmod$coefficients[1:5])
+precol<-append(precol,(rep("Tv", each=5)))
+site<-append(site,(rep("Bagley", each=5)))
+modnames<-append(modnames,(names(richmod$coefficients[1:5])))
+
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Hf")
+richmod<-glm(log(richness)~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+coef<-append(coef, richmod$coefficients[1:5])
+precol<-append(precol,(rep("Hf", each=5)))
+site<-append(site,(rep("Bagley", each=5)))
+modnames<-append(modnames,(names(richmod$coefficients[1:5])))
+
+#Now do the same for site
+coef<-append(coef, richmod$coefficients[6:10])
+precol<-append(precol,(rep("Hf", each=5)))
+site<-append(site,(rep("Bagley", each=5)))
+modnames<-append(modnames,(names(richmod$coefficients[6:10])))
+
+metadat$Site<-relevel(metadat$Site, ref="Garth")
+richmod<-glm(log(richness)~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+coef<-append(coef, richmod$coefficients[6:10])
+precol<-append(precol,(rep("Hf", each=5)))
+site<-append(site,(rep("Garth", each=5)))
+modnames<-append(modnames,(names(richmod$coefficients[6:10])))
+
+metadat$Site<-relevel(metadat$Site, ref="Tintern")
+richmod<-glm(log(richness)~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+coef<-append(coef, richmod$coefficients[6:10])
+precol<-append(precol,(rep("Hf", each=5)))
+site<-append(site,(rep("Tintern", each=5)))
+modnames<-append(modnames,(names(richmod$coefficients[6:10])))
+
+metadat$Site<-relevel(metadat$Site, ref="Usk")
+richmod<-glm(log(richness)~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+coef<-append(coef, richmod$coefficients[6:10])
+precol<-append(precol,(rep("Hf", each=5)))
+site<-append(site,(rep("Usk", each=5)))
+modnames<-append(modnames,(names(richmod$coefficients[6:10])))
+
+metadat$Site<-relevel(metadat$Site, ref="Whitestone")
+richmod<-glm(log(richness)~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+coef<-append(coef, richmod$coefficients[6:10])
+precol<-append(precol,(rep("Hf", each=5)))
+site<-append(site,(rep("Whitestone", each=5)))
+modnames<-append(modnames,(names(richmod$coefficients[6:10])))
+
+metadat$Site<-relevel(metadat$Site, ref="Wytham")
+richmod<-glm(log(richness)~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+coef<-append(coef, richmod$coefficients[6:10])
+precol<-append(precol,(rep("Hf", each=5)))
+site<-append(site,(rep("Wytham", each=5)))
+modnames<-append(modnames,(names(richmod$coefficients[6:10])))
+
+#Return the levels to normal
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="C")
+metadat$Site<-relevel(metadat$Site, ref="Bagley")
+
+#Create a dataframe of the output
+richoutput<-cbind.data.frame(modnames,coef,precol,site)
+#Convert coefficients into ratios of geometric means
+richoutput$ratios<-exp(richoutput$coef)
+```
+
+
+
+
+##Focus on taxa of interest
+###Burkholderiaceae
+```{r burk}
+###Create a Burkholderiaceae subset
+burk<-subset(msbact, select=(as.character(subset(taxbact$X.OTU.ID, taxbact$Family==" Burkholderiaceae"))))
+all.equal(as.factor(row.names(burk)), metadat$X.SampleID, check.attributes = FALSE)
+
+#Correct richness for sequencing depth
+burkrich<-rowSums(burk > 0)
+burkcorr<-glm(burkrich~depth, family=gaussian(link = identity))
+summary(burkcorr)
+burksresid1<-(burkcorr$residuals-mean(burkcorr$residuals))/sd(burkcorr$residuals)
+qqnorm(burksresid1)
+abline(0,1)
+plot(burksresid1~burkcorr$fitted.values)
+corrected.burk<-residuals(burkcorr, type = c("response"))
+
+#Plotting
+boxplot(corrected.burk~metadat$Precoloniser, notch=TRUE, 
+        xlab="Precoloniser", ylab="Detrended richness")
+boxplot(corrected.burk~metadat$Site, notch=TRUE, 
+        xlab="Site", ylab="Detrended richness")
+plot(corrected.burk~metadat$Wood.pH, col=metadat$Precoloniser, pch=20, 
+     xlab="Wood pH", ylab="Detrended richness")
+plot(corrected.burk~metadat$Soil.pH, col=metadat$Site, pch=20, 
+     xlab="Soil pH", ylab="Detrended richness")
+plot(corrected.burk~basidprop, col=metadat$Precoloniser, pch=20, 
+     xlab="% Basidiomycetes", ylab="Detrended richness")
+plot(corrected.burk~tops$cords, pch=20, notch=TRUE,
+     xlab="Cord formers", ylab="Detrended richness")
+
+#Plot boxplots overlaid with data points, coloured by asco-basid split
+ggplot(data=data.frame(x=as.factor(metadat$Precoloniser), y=corrected.burk), aes(x,y)) +
+  geom_boxplot(notch=TRUE, outlier.colour = "#ffffff") +
+  geom_point(colour="#0000ff",alpha=(basidtransp/255)) +
+  geom_point(colour="#ff0000",alpha=ascotransp/255) +
+  labs(x="Precoloniser", y="Detrended richness") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),legend.position = "none")
+#Plot boxplots overlaid with data points, coloured by cordformers
+ggplot(data=data.frame(x=as.factor(metadat$Precoloniser), y=corrected.burk), aes(x,y)) +
+  geom_boxplot(notch=TRUE, outlier.colour = "#ffffff") +
+  geom_point(aes(colour=factor(tops$cords))) +
+  scale_colour_manual(values=c("non"="black", "cord"="red")) +
+  labs(x="Precoloniser", y="Detrended richness") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),legend.position = "none")
+#Plot boxplots overlaid with data points, coloured by soil pH
+ggplot(data=data.frame(x=as.factor(metadat$Site), y=corrected.burk), aes(x,y)) +
+  geom_boxplot(notch=TRUE, outlier.colour = "#ffffff") +
+  geom_point(colour="#000000",alpha=(soilgrad/255)) +
+  labs(x="Site", y="Detrended richness") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),legend.position = "none")
+#Plot boxplots overlaid with data points, wood pH
+ggplot(data=data.frame(x=as.factor(metadat$Precoloniser), y=corrected.burk), aes(x,y)) +
+  geom_boxplot(notch=TRUE, outlier.colour = "#ffffff") +
+  geom_point(colour="#000000",alpha=(woodgrad/255)) +
+  labs(x="Precoloniser", y="Detrended richness") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),legend.position = "none")
+
+
+##Modelling Burkholderiaceae
+burkmod<-glm(burkrich~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+burksresid2<-(burkmod$residuals-mean(burkmod$residuals))/sd(burkmod$residuals)
+qqnorm(burksresid2)
+abline(0, 1)
+plot(burksresid2~burkmod$fitted.values)
+
+summary(burkmod)
+#Relevel and return to normal
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Vc")
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Tv")
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Hf")
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="C")
+
+metadat$Site<-relevel(metadat$Site, ref="Wytham")
+metadat$Site<-relevel(metadat$Site, ref="Whitestone")
+metadat$Site<-relevel(metadat$Site, ref="Usk")
+metadat$Site<-relevel(metadat$Site, ref="Tintern")
+metadat$Site<-relevel(metadat$Site, ref="Garth")
+metadat$Site<-relevel(metadat$Site, ref="Bagley")
+
+
+
+burkgen<-subset(msbact, select=(as.character(subset(taxbact$X.OTU.ID, taxbact$Genus==" Burkholderia"))))
+```
+
+###Acidobacteriaceae
+```{r acid}
+###Create a Acidobacteriaceae subset
+acid<-subset(msbact, select=(as.character(subset(taxbact$X.OTU.ID, taxbact$Family==" Acidobacteriaceae"))))
+
+#Correct richness for sequencing depth
+acidrich<-rowSums(acid > 0)
+acidcorr<-glm(acidrich~depth, family=gaussian(link = identity))
+summary(acidcorr)
+acidsresid1<-(acidcorr$residuals-mean(acidcorr$residuals))/sd(acidcorr$residuals)
+qqnorm(acidsresid1)
+abline(0,1)
+plot(acidsresid1~acidcorr$fitted.values)
+corrected.acid<-residuals(acidcorr, type = c("response"))
+
+#Plotting
+plot(corrected.acid~metadat$Precoloniser, notch=T)
+plot(corrected.acid~metadat$Site, notch=T)
+plot(corrected.acid~basidprop, col=metadat$Precoloniser, pch=20, 
+     xlab="% Basidiomycetes", ylab="Detrended richness")
+plot(corrected.acid~tops$cords, pch=20, notch=TRUE,
+     xlab="Cord formers", ylab="Detrended richness")
+
+
+#Plot boxplots overlaid with data points, coloured by asco-basid split
+ggplot(data=data.frame(x=as.factor(metadat$Precoloniser), y=corrected.acid), aes(x,y)) +
+  geom_boxplot(notch=TRUE, outlier.colour = "#ffffff") +
+  geom_point(colour="#0000ff",alpha=(basidtransp/255)) +
+  geom_point(colour="#ff0000",alpha=ascotransp/255) +
+  labs(x="Precoloniser", y="Detrended richness") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),legend.position = "none")
+#Plot boxplots overlaid with data points, coloured by cordformers
+ggplot(data=data.frame(x=as.factor(metadat$Precoloniser), y=corrected.acid), aes(x,y)) +
+  geom_boxplot(notch=TRUE, outlier.colour = "#ffffff") +
+  geom_point(aes(colour=factor(tops$cords))) +
+  scale_colour_manual(values=c("non"="black", "cord"="red")) +
+  labs(x="Precoloniser", y="Detrended richness") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),legend.position = "none")
+
+##Modelling Acidobacteriaceae
+acidmod<-glm(acidrich~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+acid.sresid<-(acidmod$residuals-mean(acidmod$residuals))/sd(acidmod$residuals)
+qqnorm(acid.sresid)
+abline(0, 1)
+plot(acid.sresid~acidmod$fitted.values)
+
+summary(acidmod)
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Vc")
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Tv")
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Hf")
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="C")
+
+metadat$Site<-relevel(metadat$Site, ref="Wytham")
+metadat$Site<-relevel(metadat$Site, ref="Whitestone")
+metadat$Site<-relevel(metadat$Site, ref="Usk")
+metadat$Site<-relevel(metadat$Site, ref="Tintern")
+metadat$Site<-relevel(metadat$Site, ref="Garth")
+metadat$Site<-relevel(metadat$Site, ref="Bagley")
+```
+
+###Acetobacteraceae
+```{r acet}
+###Create a Acetobacteraceae subset
+acet<-subset(msbact, select=(as.character(subset(taxbact$X.OTU.ID, taxbact$Family==" Acetobacteraceae"))))
+
+#Correct richness for sequencing depth
+acetrich<-rowSums(acet > 0)
+acetcorr<-glm(acetrich~depth, family=gaussian(link = identity))
+summary(acetcorr)
+acetsresid1<-(acetcorr$residuals-mean(acetcorr$residuals))/sd(acetcorr$residuals)
+qqnorm(acetsresid1)
+abline(0,1)
+plot(acetsresid1~acetcorr$fitted.values)
+corrected.acet<-residuals(acetcorr, type = c("response"))
+
+#Plotting
+plot(corrected.acet~metadat$Precoloniser, notch=T)
+plot(corrected.acet~metadat$Site, notch=T)
+plot(corrected.acet~basidprop, col=metadat$Precoloniser, pch=20, 
+     xlab="% Basidiomycetes", ylab="Detrended richness")
+plot(corrected.acet~tops$cords, pch=20, notch=TRUE,
+     xlab="Cord formers", ylab="Detrended richness")
+
+
+#Plot boxplots overlaid with data points, coloured by asco-basid split
+ggplot(data=data.frame(x=as.factor(metadat$Precoloniser), y=corrected.acet), aes(x,y)) +
+  geom_boxplot(notch=TRUE, outlier.colour = "#ffffff") +
+  geom_point(colour="#0000ff",alpha=(basidtransp/255)) +
+  geom_point(colour="#ff0000",alpha=ascotransp/255) +
+  labs(x="Precoloniser", y="Detrended richness") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),legend.position = "none")
+#Plot boxplots overlaid with data points, coloured by cordformers
+ggplot(data=data.frame(x=as.factor(metadat$Precoloniser), y=corrected.acet), aes(x,y)) +
+  geom_boxplot(notch=TRUE, outlier.colour = "#ffffff") +
+  geom_point(aes(colour=factor(tops$cords))) +
+  scale_colour_manual(values=c("non"="black", "cord"="red")) +
+  labs(x="Precoloniser", y="Detrended richness") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),legend.position = "none")
+
+##Modelling Acetobactereraceae
+acetmod<-glm(acetrich~depth + metadat$Precoloniser + metadat$Site + metadat$Soil.pH + metadat$Wood.pH, 
+             family=gaussian(link=identity))
+acet.sresid<-(acetmod$residuals-mean(acetmod$residuals))/sd(acetmod$residuals)
+qqnorm(acet.sresid)
+abline(0, 1)
+plot(acet.sresid~acetmod$fitted.values)
+
+summary(acetmod)
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Vc")
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Tv")
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="Hf")
+metadat$Precoloniser<-relevel(metadat$Precoloniser, ref="C")
+
+metadat$Site<-relevel(metadat$Site, ref="Wytham")
+metadat$Site<-relevel(metadat$Site, ref="Whitestone")
+metadat$Site<-relevel(metadat$Site, ref="Usk")
+metadat$Site<-relevel(metadat$Site, ref="Tintern")
+metadat$Site<-relevel(metadat$Site, ref="Garth")
+metadat$Site<-relevel(metadat$Site, ref="Bagley")
+```
+
+###Panelled graphs of all three taxa
+Panelled graph of precoloniser, soil pH and wood pH effects (Fig 5)
+```{r fig5}
+pdf("nineway_taxa.pdf")
+{
+par(mfrow=c(3,3), mar=c(5,5,1,1))
+#Burkholderiaceae richness
+#Boxplot by precoloniser
+plot(corrected.burk~metadat$Precoloniser, xlab="Precoloniser", ylab="Detrended richness", notch=T, ylim=c(-35,50))
+mtext("(a)", side=3, adj=-0.2)
+stripchart(corrected.burk~metadat$Precoloniser,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Plot by wood pH broken down by precoloniser
+plot(corrected.burk~metadat$Wood.pH, type="n", xlab="Wood pH", ylab="Detrended richness", ylim=c(-35,50), xlim=c(2.75,6.3))
+legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+         col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(b)", side=3, adj=-0.2)
+points(metadat$Wood.pH[metadat$Precoloniser=="C"], corrected.burk[metadat$Precoloniser=="C"], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Vc"], corrected.burk[metadat$Precoloniser=="Vc"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Tv"], corrected.burk[metadat$Precoloniser=="Tv"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Hf"], corrected.burk[metadat$Precoloniser=="Hf"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Plot by soil pH broken down by site
+plot(corrected.burk~metadat$Soil.pH, type="n", xlab="Soil pH", ylab="Detrended richness", xaxt="n", xlim=c(3.0,7.75), ylim=c(-35,50))
+axis(side=1, at=c(3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0,7.5))
+legend("topleft",  c("Bagley","Garth","Tintern","Usk","WS","W'ham"), pch=c(20,20,20,20), bty="n", cex=0.8,
+  col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=101,blue=255,green=76,maxColorValue=255)),(rgb(red=255,blue=50,green=255,maxColorValue=255)),
+               (rgb(red=255,blue=0,green=127,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(c)", side=3, adj=-0.2)
+points(metadat$Soil.pH[metadat$Site=="Bagley"], corrected.burk[metadat$Site=="Bagley"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Garth"], corrected.burk[metadat$Site=="Garth"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Tintern"], corrected.burk[metadat$Site=="Tintern"], pch=20, col=rgb(red=101,blue=255,green=76,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Usk"], corrected.burk[metadat$Site=="Usk"], pch=20, col=rgb(red=255,blue=50,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Whitestone"], corrected.burk[metadat$Site=="Whitestone"], pch=20, col=rgb(red=255,blue=0,green=127,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Wytham"], corrected.burk[metadat$Site=="Wytham"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Acidobacteriaceae
+#Boxplot by precoloniser
+plot(corrected.acid~metadat$Precoloniser, xlab="Precoloniser", ylab="Detrended richness", notch=T, ylim=c(-42,35))
+mtext("(d)", side=3, adj=-0.2)
+stripchart(corrected.acid~metadat$Precoloniser,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Plot by wood pH broken down by precoloniser
+plot(corrected.acid~metadat$Wood.pH, type="n", xlab="Wood pH", ylab="Detrended richness", xlim=c(2.75,6.3), ylim=c(-42,35))
+legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+         col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(e)", side=3, adj=-0.2)
+points(metadat$Wood.pH[metadat$Precoloniser=="C"], corrected.acid[metadat$Precoloniser=="C"], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Vc"], corrected.acid[metadat$Precoloniser=="Vc"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Tv"], corrected.acid[metadat$Precoloniser=="Tv"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Hf"], corrected.acid[metadat$Precoloniser=="Hf"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Plot by soil pH broken down by site
+plot(corrected.acid~metadat$Soil.pH, type="n", xlab="Soil pH", ylab="Detrended richness", xaxt="n", xlim=c(3.0,7.75), ylim=c(-42,35))
+axis(side=1, at=c(3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0,7.5))
+legend("topleft",  c("Bagley","Garth","Tintern","Usk","WS","W'ham"), pch=c(20,20,20,20), bty="n", cex=0.8,
+  col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=101,blue=255,green=76,maxColorValue=255)),(rgb(red=255,blue=50,green=255,maxColorValue=255)),
+               (rgb(red=255,blue=0,green=127,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(f)", side=3, adj=-0.2)
+points(metadat$Soil.pH[metadat$Site=="Bagley"], corrected.acid[metadat$Site=="Bagley"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Garth"], corrected.acid[metadat$Site=="Garth"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Tintern"], corrected.acid[metadat$Site=="Tintern"], pch=20, col=rgb(red=101,blue=255,green=76,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Usk"], corrected.acid[metadat$Site=="Usk"], pch=20, col=rgb(red=255,blue=50,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Whitestone"], corrected.acid[metadat$Site=="Whitestone"], pch=20, col=rgb(red=255,blue=0,green=127,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Wytham"], corrected.acid[metadat$Site=="Wytham"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Acetobacteraceae
+#Boxplot by precoloniser
+plot(corrected.acet~metadat$Precoloniser, xlab="Precoloniser", ylab="Detrended richness", notch=T, yaxt="n", ylim=c(-22,42))
+axis(side=2, at=c(-20,0,20,40))
+mtext("(g)", side=3, adj=-0.2)
+stripchart(corrected.acet~metadat$Precoloniser,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Plot by wood pH broken down by precoloniser
+plot(corrected.acet~metadat$Wood.pH, type="n", xlab="Wood pH", ylab="Detrended richness", yaxt="n", xlim=c(2.75,6.3), ylim=c(-22,42))
+axis(side=2, at=c(-20,0,20,40))
+legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+         col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(h)", side=3, adj=-0.2)
+points(metadat$Wood.pH[metadat$Precoloniser=="C"], corrected.acet[metadat$Precoloniser=="C"], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Vc"], corrected.acet[metadat$Precoloniser=="Vc"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Tv"], corrected.acet[metadat$Precoloniser=="Tv"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Wood.pH[metadat$Precoloniser=="Hf"], corrected.acet[metadat$Precoloniser=="Hf"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Plot by soil pH broken down by site
+plot(corrected.acet~metadat$Soil.pH, type="n", xlab="Soil pH", ylab="Detrended richness", xaxt="n", yaxt="n", xlim=c(3.0,7.75), ylim=c(-22,42))
+axis(side=1, at=c(3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0,7.5))
+axis(side=2, at=c(-20,0,20,40))
+legend("topleft",  c("Bagley","Garth","Tintern","Usk","WS","W'ham"), pch=c(20,20,20,20), bty="n", cex=0.8,
+  col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=101,blue=255,green=76,maxColorValue=255)),(rgb(red=255,blue=50,green=255,maxColorValue=255)),
+               (rgb(red=255,blue=0,green=127,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(i)", side=3, adj=-0.2)
+points(metadat$Soil.pH[metadat$Site=="Bagley"], corrected.acet[metadat$Site=="Bagley"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Garth"], corrected.acet[metadat$Site=="Garth"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Tintern"], corrected.acet[metadat$Site=="Tintern"], pch=20, col=rgb(red=101,blue=255,green=76,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Usk"], corrected.acet[metadat$Site=="Usk"], pch=20, col=rgb(red=255,blue=50,green=255,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Whitestone"], corrected.acet[metadat$Site=="Whitestone"], pch=20, col=rgb(red=255,blue=0,green=127,maxColorValue=255))
+points(metadat$Soil.pH[metadat$Site=="Wytham"], corrected.acet[metadat$Site=="Wytham"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+}
+dev.off()
+```
+
+Panelled graph of fungal effects (Fig 6)
+```{r fig6}
+pdf("fungal_fx_taxa.pdf")
+{
+par(mfrow=c(3,2), mar=c(5,5,1,1))
+#Burk
+#Plot by asco-basid split
+plot(corrected.burk~basidprop, type="n", xlab="Proportion Basidiomycota", ylab="Detrended richness", ylim=c(-35,50))
+points(basidprop, corrected.burk, pch=20, col=rgb(red=ascotransp,blue=basidtransp,green=0,maxColorValue=255))
+legend("topleft",  c("Ascomycetes","Basidiomycetes"), pch=c(20,20), bty="n", cex=0.8,
+       col=c((rgb(red=255,blue=0,green=0,maxColorValue=255)),(rgb(red=0,blue=255,green=0,maxColorValue=255))))
+mtext("(a)", side=3, adj=-0.2)
+#Boxplot by cord-formers
+plot(corrected.burk~tops$cords, xlab="Cord-forming", ylab="Detrended richness", notch=T, ylim=c(-35,50))
+mtext("(b)", side=3, adj=-0.2)
+stripchart(corrected.burk~tops$cords,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Acid
+#Plot by asco-basid split
+plot(corrected.acid~basidprop, type="n", xlab="Proportion Basidiomycota", ylab="Detrended richness", ylim=c(-42,35))
+points(basidprop, corrected.acid, pch=20, col=rgb(red=ascotransp,blue=basidtransp,green=0,maxColorValue=255))
+legend("topleft",  c("Ascomycetes","Basidiomycetes"), pch=c(20,20), bty="n", cex=0.8,
+       col=c((rgb(red=255,blue=0,green=0,maxColorValue=255)),(rgb(red=0,blue=255,green=0,maxColorValue=255))))
+mtext("(c)", side=3, adj=-0.2)
+#Boxplot by cord-formers
+plot(corrected.acid~tops$cords, xlab="Cord-forming", ylab="Detrended richness", notch=T, ylim=c(-42,35))
+mtext("(d)", side=3, adj=-0.2)
+stripchart(corrected.acid~tops$cords,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Acet
+#Plot by asco-basid split
+plot(corrected.acet~basidprop, type="n", xlab="Proportion Basidiomycota", ylab="Detrended richness", yaxt="n", ylim=c(-22,40))
+axis(side=2, at=c(-20,0,20,40))
+points(basidprop, corrected.acet, pch=20, col=rgb(red=ascotransp,blue=basidtransp,green=0,maxColorValue=255))
+legend("topleft",  c("Ascomycetes","Basidiomycetes"), pch=c(20,20), bty="n", cex=0.8,
+       col=c((rgb(red=255,blue=0,green=0,maxColorValue=255)),(rgb(red=0,blue=255,green=0,maxColorValue=255))))
+mtext("(e)", side=3, adj=-0.2)
+#Boxplot by cord-formers
+plot(corrected.acet~tops$cords, xlab="Cord-forming", ylab="Detrended richness", notch=T, yaxt="n", ylim=c(-22,40))
+axis(side=2, at=c(-20,0,20,40))
+mtext("(f)", side=3, adj=-0.2)
+stripchart(corrected.acet~tops$cords,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+}
+dev.off()
+```
+
+Panelled site plot (Fig S6)
+```{r figS6}
+pdf("site_taxa.pdf")
+{
+par(mfrow=c(2,2), mar=c(5,5,1,1))
+#Burk
+boxplot(corrected.burk~metadat$Site, xlab="Site", ylab="Detrended richness", notch=T, ylim=c(-35,50),  names=c("B","G","T","U","WS","Wy"))
+mtext("(a)", side=3, adj=-0.2)
+stripchart(corrected.burk~metadat$Site,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Acid
+plot(corrected.acid~metadat$Site, xlab="Site", ylab="Detrended richness", notch=T, ylim=c(-42,35),  names=c("B","G","T","U","WS","Wy"))
+mtext("(b)", side=3, adj=-0.2)
+stripchart(corrected.acid~metadat$Site,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+#Acet
+plot(corrected.acet~metadat$Site, xlab="Site", ylab="Detrended richness", notch=T, yaxt="n", ylim=c(-22,40),  names=c("B","G","T","U","WS","Wy"))
+axis(side=2, at=c(-20,0,20,40))
+mtext("(c)", side=3, adj=-0.2)
+stripchart(corrected.acet~metadat$Site,col="#000000",vertical = TRUE,pch=20,add=TRUE)
+}
+dev.off()
+```
