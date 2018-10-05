@@ -1,7 +1,7 @@
 ---
 title: "Multisite bacterial community analysis"
 author: "Sarah R. Johnston"
-date: "16 March 2017"
+date: "05 October 2018"
 output: html_document
 ---
 
@@ -385,9 +385,15 @@ points(subset(BCnmds2$points, metadat$Site=="Whitestone"), pch=20, col=rgb(red=2
 points((subset(BCnmds2$points, metadat$Site=="Wytham")), pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
 #By wood pH
 plot(BCnmds2$points, pch=20, xlim=c(-2.5, 1.5), col=rgb(red=200,blue=100,green=0,alpha=woodgrad,maxColorValue=255))
+legend("topleft",  c("pH3","pH4", "pH5", "pH6"), pch=c(20,20,20,20), bty="n", cex=0.8,
+       col=c((rgb(red=200,blue=100,green=0,alpha=120,maxColorValue=255)),(rgb(red=200,blue=100,green=0,alpha=160,maxColorValue=255)),
+             (rgb(red=200,blue=100,green=0,alpha=200,maxColorValue=255)),(rgb(red=200,blue=100,green=0,alpha=240,maxColorValue=255))))
 mtext("(c)", side=3, adj=-0.2)
 #By soil pH
 plot(BCnmds2$points, pch=20, xlim=c(-2.5, 1.5), col=rgb(red=200,blue=0,green=100,alpha=soilgrad,maxColorValue=255))
+legend("topleft",  c("pH4", "pH5", "pH6","pH7"), pch=c(20,20,20,20,20), bty="n", cex=0.8,
+       col=c((rgb(red=200,blue=0,green=100,alpha=129,maxColorValue=255)),(rgb(red=200,blue=0,green=100,alpha=161,maxColorValue=255)),
+             (rgb(red=200,blue=0,green=100,alpha=194,maxColorValue=255)),(rgb(red=200,blue=0,green=100,alpha=226,maxColorValue=255))))
 mtext("(d)", side=3, adj=-0.2)
 #By precoloniser persistance, with transparency dictated by proportion of disk occupied at the time of collection
 cpersist<-(subset(metadat$Persistance, metadat$Precoloniser=="C"))*2.55
@@ -397,6 +403,8 @@ hfpersist<-(subset(metadat$Persistance, metadat$Precoloniser=="Hf"))*2.55
 plot(BCnmds2$points, pch=20, type="n", xlim=c(-2.5, 1.5))
 legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
        col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=0,blue=255,green=0,maxColorValue=255)),(rgb(red=0,blue=0,green=255,maxColorValue=255)),(rgb(red=255,blue=0,green=0,maxColorValue=255))))
+legend("topleft", inset=c(0.15,0),  c("25%", "50%", "75%", "100%"), pch=c(20,20,20,20), bty="n", cex=0.8,
+       col=c((rgb(red=255,blue=0,green=0,alpha=64,maxColorValue=255)),(rgb(red=255,blue=0,green=0,alpha=128,maxColorValue=255)),(rgb(red=255,blue=0,green=0,alpha=191,maxColorValue=255)),(rgb(red=255,blue=0,green=0,alpha=255,maxColorValue=255))))
 mtext("(e)", side=3, adj=-0.2)
 points((subset(BCnmds2$points, metadat$Precoloniser=="C")), pch=20, col=rgb(red=0,blue=0,green=0,alpha=cpersist,maxColorValue=255))
 points((subset(BCnmds2$points, metadat$Precoloniser=="Vc")), pch=20, col=rgb(red=0,blue=255,green=0,alpha=vcpersist,maxColorValue=255))
@@ -451,6 +459,9 @@ par(mfrow=c(3,2))
 for (i in levels(metadat$Site))
 {
   plot(BCnmds2$points, type="n", main={i})
+  legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n",
+       col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
   points((subset(BCnmds2$points, metadat$Precoloniser=="C" & metadat$Site=={i})), pch=20, cex=1.8, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
   points((subset(BCnmds2$points, metadat$Precoloniser=="Vc" & metadat$Site=={i})), pch=20, cex=1.8, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
   points((subset(BCnmds2$points, metadat$Precoloniser=="Tv" & metadat$Site=={i})), pch=20, cex=1.8, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
@@ -530,7 +541,7 @@ disp.model2
 TukeyHSD(betadisper (dist2, metadat$Precoloniser))
 
 #PERMANOVA
-pma<-adonis(msbact ~  metadat$Precoloniser*metadat$Site, permutations = 999, method = "bray", strata = NULL)
+pma<-adonis(msbact ~  depth+metadat$Precoloniser*metadat$Site, permutations = 999, method = "bray", strata = NULL)
 pma
 boxplot(pma$coefficients~rownames(pma$coefficients))
 
@@ -619,6 +630,47 @@ metlist<-list(
   mWyVcHf=subset(metadat, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham"),
   mWyTvHf=subset(metadat, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham")
 )
+#Create a list containing subsets of the depth in all pairwise combinations
+depthlist<-list(
+  dBCVc=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Bagley"),
+  dBCTv=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Bagley"),
+  dBVcTv=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Bagley"),
+
+  dGCVc=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Garth"),
+  dGCTv=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Garth"),
+  dGCHf=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Garth"),
+  dGVcTv=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Garth"),
+  dGVcHf=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Garth"),
+  dGTvHf=subset(depth, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Garth"),
+
+  dTCVc=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Tintern"),
+  dTCTv=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Tintern"),
+  dTCHf=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Tintern"),
+  dTVcTv=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Tintern"),
+  dTVcHf=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Tintern"),
+  dTTvHf=subset(depth, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Tintern"),
+
+  dUCVc=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Usk"),
+  dUCTv=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Usk"),
+  dUCHf=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Usk"),
+  dUVcTv=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Usk"),
+  dUVcHf=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Usk"),
+  dUTvHf=subset(depth, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Usk"),
+
+  dWsCVc=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Whitestone"),
+  dWsCTv=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Whitestone"),
+  dWsCHf=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Whitestone"),
+  dWsVcTv=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Whitestone"),
+  dWsVcHf=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Whitestone"),
+  dWsTvHf=subset(depth, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Whitestone"),
+
+  dWyCVc=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Vc") & metadat$Site=="Wytham"),
+  dWyCTv=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Tv") & metadat$Site=="Wytham"),
+  dWyCHf=subset(depth, (metadat$Precoloniser=="C" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham"),
+  dWyVcTv=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Tv") & metadat$Site=="Wytham"),
+  dWyVcHf=subset(depth, (metadat$Precoloniser=="Vc" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham"),
+  dWyTvHf=subset(depth, (metadat$Precoloniser=="Tv" | metadat$Precoloniser=="Hf") & metadat$Site=="Wytham")
+)
 
 #Run PERMANOVA on all pairwise combinations
 #Takes a long time
@@ -632,8 +684,9 @@ pma.factors<-list(length=33)
   pma.data[i]<-names(pairslist[i])
   pma.factors[i]<-names(metlist[i])
   pma.met<-names(metlist[i])
+  pma.dep<-names(depthlist[i])
   print(pma.met) #Prints the name of each comparison, so warnings can be linked to the relevant test
-  pma.models[i]<-adonis(pairslist[[i]] ~ (metlist[[i]])$Precoloniser, permutations = 999, method = "bray", strata = NULL)
+  pma.models[i]<-adonis(pairslist[[i]] ~ (depthlist[[i]])+(metlist[[i]])$Precoloniser, permutations = 999, method = "bray", strata = NULL)
 }
 
 #Dispersion tests for all the pairwise combination datasets
@@ -661,7 +714,7 @@ adjusted
 hist(adjusted)
 
 #Combine columns: name of the response variable subset, name of the predictor variable subset, raw p-value and adjusted p-value
-p.pairs<-as.table(cbind(pma.data, pma.factors, plist, adjusted))
+p.pairs<-as.data.frame(cbind(pma.data, pma.factors, plist, adjusted))
 
 #Examine values with borderline significance
 p.pairs[(p.pairs$adjusted<0.07),]
